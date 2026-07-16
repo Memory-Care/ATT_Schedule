@@ -1,0 +1,317 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>欣智樂 Kisunla 治療排程產生器</title>
+  <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+TC:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  <script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/react/18.3.1/umd/react.production.min.js"></script>
+  <script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.3.1/umd/react-dom.production.min.js"></script>
+  <script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.26.2/babel.min.js"></script>
+  <script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { font-family: 'Noto Sans TC', system-ui, sans-serif; background: #f5f6f8; }
+    input:focus { border-color: #2874a6 !important; }
+    input[type="date"],
+    input[type="text"],
+    input[type="number"] {
+      -webkit-appearance: none;
+      appearance: none;
+      height: 44px;
+    }
+    button { transition: opacity 0.15s; }
+    button:active { opacity: 0.8; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+  <script type="text/babel">
+    const { useState, useMemo } = React;
+
+    function avoidWeekend(d) {
+      const date = new Date(d);
+      const day = date.getDay();
+      if (day === 0) date.setDate(date.getDate() - 2);
+      if (day === 6) date.setDate(date.getDate() - 1);
+      return date;
+    }
+
+    function generateSchedule(firstDate, mriDaysBefore) {
+      const events = [];
+      const start = new Date(firstDate + "T00:00:00");
+      const mriBeforeDoses = new Set([2, 3, 4, 7]);
+      const daysBefore = parseInt(mriDaysBefore) || 7;
+
+      for (let i = 0; i < 19; i++) {
+        const infusionDate = new Date(start);
+        infusionDate.setDate(infusionDate.getDate() + i * 28);
+        const doseNum = i + 1;
+        const week = i * 4;
+
+        if (mriBeforeDoses.has(doseNum)) {
+          let mriDate = new Date(infusionDate);
+          mriDate.setDate(mriDate.getDate() - daysBefore);
+          mriDate = avoidWeekend(mriDate);
+          events.push({
+            type: "mri",
+            label: `MRI（第${doseNum}次輸注前）`,
+            week: `W${week}`,
+            date: mriDate,
+            startHour: 9, startMin: 0, endHour: 11, endMin: 0,
+            doseRef: doseNum,
+          });
+        }
+
+        events.push({
+          type: "infusion",
+          label: `第${doseNum}次輸注`,
+          week: `W${week}`,
+          date: infusionDate,
+          doseNumber: doseNum,
+          startHour: 12, startMin: 0,
+          endHour: doseNum <= 3 ? 15 : 14, endMin: 0,
+        });
+      }
+
+      events.sort((a, b) => a.date - b.date);
+      return events;
+    }
+
+    function formatDate(d) {
+      return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+    }
+
+    function formatDateTW(d) {
+      const weekday = ["日", "一", "二", "三", "四", "五", "六"][d.getDay()];
+      return `${d.getFullYear()}/${d.getMonth() + 1}/${d.getDate()} (${weekday})`;
+    }
+
+    function toICSDateTime(d, hour, min) {
+      const y = d.getFullYear();
+      const m = String(d.getMonth() + 1).padStart(2, "0");
+      const day = String(d.getDate()).padStart(2, "0");
+      return `${y}${m}${day}T${String(hour).padStart(2, "0")}${String(min).padStart(2, "0")}00`;
+    }
+
+    function generateICS(events, patientName) {
+      const lines = [
+        "BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//Kisunla Schedule//TW//",
+        "CALSCALE:GREGORIAN", "METHOD:PUBLISH",
+        `X-WR-CALNAME:${patientName || "患者"} - Kisunla 治療排程`,
+        "X-WR-TIMEZONE:Asia/Taipei",
+      ];
+      events.forEach((ev, i) => {
+        const summary = ev.type === "infusion" ? `Kisunla ${ev.label}` : ev.label;
+        lines.push("BEGIN:VEVENT");
+        lines.push(`DTSTART;TZID=Asia/Taipei:${toICSDateTime(ev.date, ev.startHour, ev.startMin)}`);
+        lines.push(`DTEND;TZID=Asia/Taipei:${toICSDateTime(ev.date, ev.endHour, ev.endMin)}`);
+        lines.push(`SUMMARY:${summary}`);
+        if (patientName) lines.push(`DESCRIPTION:患者: ${patientName}`);
+        lines.push(`UID:kisunla-${ev.type}-${i}-${Date.now()}@scheduler`);
+        lines.push("END:VEVENT");
+      });
+      lines.push("END:VCALENDAR");
+      return lines.join("\r\n");
+    }
+
+    function generateExcel(events, patientName, firstDate, mriDaysBefore) {
+      const header = [
+        ["Kisunla (Donanemab) 欣智樂 治療排程表"],
+        [`患者姓名: ${patientName || "—"}`],
+        [`首次治療日: ${firstDate}`],
+        [`MRI 排程: 輸注前 ${mriDaysBefore} 天（避開週末）`],
+        [`製表日期: ${formatDate(new Date())}`],
+        [],
+        ["序號", "週次", "日期", "星期", "類型", "項目", "備註"],
+      ];
+      let seq = 0;
+      const rows = events.map((ev) => {
+        seq++;
+        const weekday = ["日", "一", "二", "三", "四", "五", "六"][ev.date.getDay()];
+        return [
+          seq, ev.week, formatDate(ev.date), weekday,
+          ev.type === "infusion" ? "輸注" : "MRI",
+          ev.label,
+          ev.type === "mri" ? `第${ev.doseRef}次輸注前` : "",
+        ];
+      });
+      const data = [...header, ...rows];
+      const ws = XLSX.utils.aoa_to_sheet(data);
+      ws["!cols"] = [
+        { wch: 6 }, { wch: 6 }, { wch: 12 }, { wch: 5 },
+        { wch: 6 }, { wch: 18 }, { wch: 14 },
+      ];
+      ws["!merges"] = [{ s: { r: 0, c: 0 }, e: { r: 0, c: 6 } }];
+      const wb = XLSX.utils.book_new();
+      XLSX.utils.book_append_sheet(wb, ws, "治療排程");
+      return wb;
+    }
+
+    function download(content, filename, type) {
+      const blob = new Blob([content], { type });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = filename;
+      a.click();
+      URL.revokeObjectURL(url);
+    }
+
+    function Badge({ type }) {
+      const isInf = type === "infusion";
+      return (
+        <span style={{
+          display: "inline-block", padding: "2px 8px", borderRadius: 4,
+          fontSize: 11, fontWeight: 600,
+          color: isInf ? "#1a5276" : "#6c3483",
+          background: isInf ? "#d4e6f1" : "#e8daef",
+        }}>
+          {isInf ? "💉 輸注" : "🧠 MRI"}
+        </span>
+      );
+    }
+
+    function App() {
+      const [firstDate, setFirstDate] = useState("");
+      const [patientName, setPatientName] = useState("");
+      const [mriDays, setMriDays] = useState("7");
+      const [tab, setTab] = useState("all");
+
+      const events = useMemo(() => firstDate ? generateSchedule(firstDate, mriDays) : [], [firstDate, mriDays]);
+      const filtered = useMemo(() => tab === "all" ? events : events.filter((e) => e.type === tab), [events, tab]);
+
+      const infCount = events.filter((e) => e.type === "infusion").length;
+      const mriCount = events.filter((e) => e.type === "mri").length;
+      const lastEv = events.length ? events[events.length - 1] : null;
+
+      const handleICS = () => {
+        if (!events.length) return;
+        download(generateICS(events, patientName), `Kisunla_${patientName || "patient"}.ics`, "text/calendar;charset=utf-8");
+      };
+      const handleXLSX = () => {
+        if (!events.length) return;
+        XLSX.writeFile(generateExcel(events, patientName, firstDate, mriDays), `Kisunla_${patientName || "patient"}.xlsx`);
+      };
+
+      return (
+        <div style={{ minHeight: "100vh", background: "#f5f6f8" }}>
+          <div style={{ background: "linear-gradient(135deg, #1a3c5e 0%, #2874a6 100%)", color: "#fff", padding: "24px 20px 20px" }}>
+            <div style={{ maxWidth: 700, margin: "0 auto" }}>
+              <div style={{ fontSize: 11, letterSpacing: 2, opacity: 0.6, marginBottom: 2 }}>KISUNLA™ (DONANEMAB-AZBT)</div>
+              <h1 style={{ margin: 0, fontSize: 20, fontWeight: 700 }}>欣智樂 治療排程產生器</h1>
+              <p style={{ margin: "4px 0 0", fontSize: 12, opacity: 0.75 }}>
+                Q4W 輸注 × 19 次 ｜ MRI 於第 2、3、4、7 次輸注前（自訂天數，避開週末）
+              </p>
+            </div>
+          </div>
+
+          <div style={{ maxWidth: 700, margin: "0 auto", padding: "16px 14px 40px" }}>
+            <div style={{ background: "#fff", borderRadius: 10, padding: "18px", marginBottom: 14, boxShadow: "0 1px 3px rgba(0,0,0,0.06)" }}>
+              <div style={{ display: "flex", gap: 12, flexWrap: "wrap" }}>
+                <div style={{ flex: "1 1 120px" }}>
+                  <label style={{ display: "block", fontSize: 12, fontWeight: 600, color: "#666", marginBottom: 5 }}>患者姓名</label>
+                  <input type="text" placeholder="選填" value={patientName} onChange={(e) => setPatientName(e.target.value)}
+                    style={{ width: "100%", padding: "9px 11px", border: "1.5px solid #d5d8dc", borderRadius: 6, fontSize: 15, boxSizing: "border-box", outline: "none" }} />
+                </div>
+                <div style={{ flex: "1 1 120px" }}>
+                  <label style={{ display: "block", fontSize: 12, fontWeight: 600, color: "#666", marginBottom: 5 }}>首次治療日 *</label>
+                  <input type="date" value={firstDate} onChange={(e) => setFirstDate(e.target.value)}
+                    style={{ width: "100%", padding: "9px 11px", border: "1.5px solid #d5d8dc", borderRadius: 6, fontSize: 15, boxSizing: "border-box", outline: "none" }} />
+                </div>
+                <div style={{ flex: "0 0 110px" }}>
+                  <label style={{ display: "block", fontSize: 12, fontWeight: 600, color: "#666", marginBottom: 5 }}>MRI 提前天數</label>
+                  <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                    <input type="number" min="1" max="28" value={mriDays} onChange={(e) => setMriDays(e.target.value)}
+                      style={{ width: 60, padding: "9px 8px", border: "1.5px solid #d5d8dc", borderRadius: 6, fontSize: 15, textAlign: "center", outline: "none" }} />
+                    <span style={{ fontSize: 13, color: "#888" }}>天</span>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            {events.length > 0 ? (
+              <>
+                <div style={{ display: "flex", gap: 8, marginBottom: 14, flexWrap: "wrap" }}>
+                  {[
+                    { val: infCount, unit: "次輸注", color: "#2874a6" },
+                    { val: mriCount, unit: "次 MRI", color: "#6c3483" },
+                    { val: lastEv ? formatDateTW(lastEv.date) : "—", unit: "最後排程", color: "#1e8449", small: true },
+                  ].map((c, i) => (
+                    <div key={i} style={{ flex: "1 1 90px", background: "#fff", borderRadius: 8, padding: "12px 14px", boxShadow: "0 1px 3px rgba(0,0,0,0.05)", borderLeft: `3px solid ${c.color}` }}>
+                      <div style={{ fontSize: c.small ? 13 : 22, fontWeight: 700, color: c.color }}>{c.val}</div>
+                      <div style={{ fontSize: 11, color: "#999" }}>{c.unit}</div>
+                    </div>
+                  ))}
+                </div>
+
+                <div style={{ display: "flex", gap: 10, marginBottom: 16, flexWrap: "wrap" }}>
+                  <button onClick={handleICS} style={{ flex: 1, padding: "11px 14px", background: "#2874a6", color: "#fff", border: "none", borderRadius: 8, fontSize: 13, fontWeight: 600, cursor: "pointer", minWidth: 140 }}>
+                    📅 下載日曆檔 (.ics)
+                  </button>
+                  <button onClick={handleXLSX} style={{ flex: 1, padding: "11px 14px", background: "#1e8449", color: "#fff", border: "none", borderRadius: 8, fontSize: 13, fontWeight: 600, cursor: "pointer", minWidth: 140 }}>
+                    📊 下載 Excel 表格
+                  </button>
+                </div>
+
+                <div style={{ display: "flex", marginBottom: 10, background: "#e5e8eb", borderRadius: 8, padding: 3 }}>
+                  {[
+                    { key: "all", label: `全部 (${events.length})` },
+                    { key: "infusion", label: `輸注 (${infCount})` },
+                    { key: "mri", label: `MRI (${mriCount})` },
+                  ].map((t) => (
+                    <button key={t.key} onClick={() => setTab(t.key)} style={{
+                      flex: 1, padding: "7px 10px", border: "none", borderRadius: 6,
+                      fontSize: 12, fontWeight: tab === t.key ? 700 : 400,
+                      background: tab === t.key ? "#fff" : "transparent",
+                      color: tab === t.key ? "#1a3c5e" : "#777", cursor: "pointer",
+                      boxShadow: tab === t.key ? "0 1px 3px rgba(0,0,0,0.08)" : "none",
+                    }}>{t.label}</button>
+                  ))}
+                </div>
+
+                <div style={{ background: "#fff", borderRadius: 10, overflow: "hidden", boxShadow: "0 1px 3px rgba(0,0,0,0.06)" }}>
+                  <div style={{ display: "flex", padding: "9px 14px", background: "#f0f2f5", fontSize: 11, fontWeight: 600, color: "#888", borderBottom: "1px solid #e8eaed" }}>
+                    <div style={{ width: 42 }}>週次</div>
+                    <div style={{ flex: 1 }}>日期</div>
+                    <div style={{ width: 65, textAlign: "center" }}>類型</div>
+                    <div style={{ flex: 1 }}>項目</div>
+                  </div>
+                  {filtered.map((ev, i) => {
+                    const isPast = ev.date < new Date();
+                    const isToday = formatDate(ev.date) === formatDate(new Date());
+                    return (
+                      <div key={i} style={{
+                        display: "flex", alignItems: "center", padding: "11px 14px",
+                        borderBottom: i < filtered.length - 1 ? "1px solid #f2f3f5" : "none",
+                        opacity: isPast && !isToday ? 0.45 : 1,
+                        background: isToday ? "#fffde7" : "transparent", fontSize: 13,
+                      }}>
+                        <div style={{ width: 42, fontWeight: 600, color: "#aaa", fontSize: 11 }}>{ev.week}</div>
+                        <div style={{ flex: 1, fontWeight: 500 }}>{formatDateTW(ev.date)}</div>
+                        <div style={{ width: 65, textAlign: "center" }}><Badge type={ev.type} /></div>
+                        <div style={{ flex: 1, paddingLeft: 6, fontWeight: 500, fontSize: 12 }}>{ev.label}</div>
+                      </div>
+                    );
+                  })}
+                </div>
+
+                <div style={{ marginTop: 14, padding: "11px 14px", background: "#fef9e7", borderRadius: 8, fontSize: 11, color: "#7d6608", lineHeight: 1.7 }}>
+                  ⚠️ 此排程為標準建議時程，實際日期需依醫師評估調整。MRI 若遇週六日將自動提前至週五。
+                </div>
+              </>
+            ) : (
+              <div style={{ textAlign: "center", padding: "50px 20px", color: "#bbb" }}>
+                <div style={{ fontSize: 36, marginBottom: 10 }}>📅</div>
+                <div style={{ fontSize: 14 }}>請輸入首次治療日以產生排程</div>
+              </div>
+            )}
+          </div>
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+  </script>
+</body>
+</html>
