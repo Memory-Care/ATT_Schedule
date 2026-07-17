@@ -1,0 +1,439 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>欣智樂 Kisunla 治療排程產生器</title>
+  <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+TC:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  <script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/react/18.3.1/umd/react.production.min.js"></script>
+  <script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.3.1/umd/react-dom.production.min.js"></script>
+  <script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.26.2/babel.min.js"></script>
+  <script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { font-family: 'Noto Sans TC', system-ui, sans-serif; background: #f5f6f8; }
+    input:focus { border-color: #FF9224 !important; }
+    input[type="date"], input[type="text"], input[type="number"], input[type="email"], input[type="url"] {
+      -webkit-appearance: none; appearance: none; height: 44px;
+    }
+    button { transition: opacity 0.15s; }
+    button:active { opacity: 0.8; }
+    .date-cell { position: relative; cursor: pointer; padding: 6px 4px; border-radius: 4px; }
+    .date-cell:hover { background: #fef3e2; }
+    .date-cell input { position: absolute; top: 0; left: 0; width: 100%; height: 100%; opacity: 0; cursor: pointer; border: none; font-size: 16px; }
+    .toast { position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%); padding: 10px 20px; border-radius: 8px; font-size: 13px; font-weight: 600; z-index: 999; opacity: 0; transition: opacity 0.3s; pointer-events: none; max-width: 90%; }
+    .toast.show { opacity: 1; }
+    .toast.ok { background: #27ae60; color: #fff; }
+    .toast.err { background: #e74c3c; color: #fff; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+  <script type="text/babel">
+    const { useState, useMemo, useCallback } = React;
+
+    const TEMPLATE_COPY_URL = "https://docs.google.com/spreadsheets/d/1_2ovVCjFA5IMb5HWb_gRmpW679x1dxZx46_wCSUtwTQ/copy";
+
+    function avoidWeekend(d) {
+      const date = new Date(d);
+      const day = date.getDay();
+      if (day === 0) date.setDate(date.getDate() - 2);
+      if (day === 6) date.setDate(date.getDate() - 1);
+      return date;
+    }
+
+    function generateSchedule(firstDate, mriDaysBefore) {
+      const events = [];
+      const start = new Date(firstDate + "T00:00:00");
+      const mriBeforeDoses = new Set([2, 3, 4, 7]);
+      const daysBefore = parseInt(mriDaysBefore) || 7;
+      for (let i = 0; i < 19; i++) {
+        const infusionDate = new Date(start);
+        infusionDate.setDate(infusionDate.getDate() + i * 28);
+        const doseNum = i + 1;
+        const week = i * 4;
+        if (mriBeforeDoses.has(doseNum)) {
+          let mriDate = new Date(infusionDate);
+          mriDate.setDate(mriDate.getDate() - daysBefore);
+          mriDate = avoidWeekend(mriDate);
+          events.push({ id: `mri-${doseNum}`, type: "mri", label: `MRI（第${doseNum}次輸注前）`, week: `W${week}`, date: mriDate, startHour: 9, startMin: 0, endHour: 11, endMin: 0, doseRef: doseNum, edited: false });
+        }
+        events.push({ id: `inf-${doseNum}`, type: "infusion", label: `第${doseNum}次輸注`, week: `W${week}`, date: infusionDate, doseNumber: doseNum, startHour: 12, startMin: 0, endHour: doseNum <= 3 ? 15 : 14, endMin: 0, edited: false });
+      }
+      events.sort((a, b) => a.date - b.date);
+      return events;
+    }
+
+    function formatDate(d) { return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}-${String(d.getDate()).padStart(2,"0")}`; }
+    function formatDateTW(d) { const wd=["日","一","二","三","四","五","六"][d.getDay()]; return `${d.getFullYear()}/${d.getMonth()+1}/${d.getDate()} (${wd})`; }
+    function toICSDateTime(d,h,m) { return `${d.getFullYear()}${String(d.getMonth()+1).padStart(2,"0")}${String(d.getDate()).padStart(2,"0")}T${String(h).padStart(2,"0")}${String(m).padStart(2,"0")}00`; }
+
+    function generateICS(events, name) {
+      const l=["BEGIN:VCALENDAR","VERSION:2.0","PRODID:-//Kisunla Schedule//TW//","CALSCALE:GREGORIAN","METHOD:PUBLISH",`X-WR-CALNAME:${name||"患者"} - Kisunla 治療排程`,"X-WR-TIMEZONE:Asia/Taipei"];
+      events.forEach((ev,i)=>{const s=ev.type==="infusion"?`Kisunla ${ev.label}`:ev.label;l.push("BEGIN:VEVENT",`DTSTART;TZID=Asia/Taipei:${toICSDateTime(ev.date,ev.startHour,ev.startMin)}`,`DTEND;TZID=Asia/Taipei:${toICSDateTime(ev.date,ev.endHour,ev.endMin)}`,`SUMMARY:${s}`);if(name)l.push(`DESCRIPTION:患者: ${name}`);l.push(`UID:kisunla-${ev.type}-${i}-${Date.now()}@scheduler`,"END:VEVENT");});
+      l.push("END:VCALENDAR"); return l.join("\r\n");
+    }
+
+    function generateExcel(events, name, firstDate, mriDays) {
+      const header=[["Kisunla (Donanemab) 欣智樂 治療排程表"],[`患者姓名: ${name||"—"}`],[`首次治療日: ${firstDate}`],[`MRI 排程: 輸注前 ${mriDays} 天（避開週末）`],[`製表日期: ${formatDate(new Date())}`],[],["序號","週次","日期","星期","類型","項目","備註"]];
+      let seq=0;const rows=events.map(ev=>{seq++;const wd=["日","一","二","三","四","五","六"][ev.date.getDay()];return[seq,ev.week,formatDate(ev.date),wd,ev.type==="infusion"?"輸注":"MRI",ev.label,ev.edited?"⚠ 已手動調整":(ev.type==="mri"?`第${ev.doseRef}次輸注前`:"")];});
+      const ws=XLSX.utils.aoa_to_sheet([...header,...rows]);ws["!cols"]=[{wch:6},{wch:6},{wch:12},{wch:5},{wch:6},{wch:18},{wch:14}];ws["!merges"]=[{s:{r:0,c:0},e:{r:0,c:6}}];
+      const wb=XLSX.utils.book_new();XLSX.utils.book_append_sheet(wb,ws,"治療排程");return wb;
+    }
+
+    function dlFile(c,f,t){const b=new Blob([c],{type:t});const u=URL.createObjectURL(b);const a=document.createElement("a");a.href=u;a.download=f;a.click();URL.revokeObjectURL(u);}
+
+    async function postToSheet(url,name,email,firstDate,mriDays,events){
+      if(!url)return false;
+      try{await fetch(url,{method:"POST",mode:"no-cors",headers:{"Content-Type":"application/json"},body:JSON.stringify({patientName:name||"未填",email,firstDate,mriDaysBefore:mriDays,events:events.map(ev=>({type:ev.type,label:ev.label,date:formatDate(ev.date)})),createdAt:new Date().toISOString()})});return true;}catch(e){console.error(e);return false;}
+    }
+
+    function Badge({type}){const i=type==="infusion";return<span style={{display:"inline-block",padding:"2px 8px",borderRadius:4,fontSize:11,fontWeight:600,whiteSpace:"nowrap",color:i?"#1a5276":"#6c3483",background:i?"#d4e6f1":"#e8daef"}}>{i?"💉 輸注":"🧠 MRI"}</span>;}
+    function Toast({msg,type,show}){return<div className={`toast ${type} ${show?"show":""}`}>{msg}</div>;}
+    function createPatient(id){return{id,name:"",firstDate:"",mriDays:"7",events:[],filter:"all"};}
+    function getNextEvent(events){const now=new Date();now.setHours(0,0,0,0);return events.find(ev=>ev.date>=now)||null;}
+
+    // ============ SETUP GUIDE PAGE ============
+    function SetupPage() {
+      const steps = [
+        { icon: "1️⃣", title: "複製 Google Sheet 模板", desc: "點擊下方按鈕，Google 會自動建立一份副本到你的雲端硬碟，內含提醒系統程式碼。" },
+        { icon: "2️⃣", title: "部署 Apps Script", desc: "開啟副本 → 上方選單「擴充功能」→「Apps Script」→ 點選「部署」→「新增部署」→ 類型選「網頁應用程式」。" },
+        { icon: "3️⃣", title: "設定部署權限", desc: "執行身分選「自己」、存取權限選「所有人」→ 按「部署」→ 複製產生的 URL。" },
+        { icon: "4️⃣", title: "設定每日觸發條件", desc: "回到 Apps Script → 左側「觸發條件」→「新增觸發條件」→ 函式選 sendDailyReminders → 時間驅動 → 日計時器 → 上午 8-9 點 → 儲存。" },
+        { icon: "5️⃣", title: "貼上 URL", desc: "回到本網頁「排程編輯」頁，展開「⚙️ 進階設定」，將部署 URL 和通知 Email 填入即可。" },
+      ];
+
+      return (
+        <div style={{ maxWidth: 700, margin: "0 auto", padding: "16px 14px 40px" }}>
+          <h2 style={{ fontSize: 17, fontWeight: 700, color: "#333", marginBottom: 16 }}>⚙️ 設定指南</h2>
+          <p style={{ fontSize: 13, color: "#666", marginBottom: 16, lineHeight: 1.7 }}>
+            完成以下步驟，即可啟用「自動 Email 提醒」功能。每家醫院各自複製一份模板，資料完全獨立。
+          </p>
+
+          {/* Copy template button */}
+          <a href={TEMPLATE_COPY_URL} target="_blank" rel="noopener noreferrer" style={{
+            display: "block", textAlign: "center", padding: "14px 20px", background: "#FF9224", color: "#fff",
+            border: "none", borderRadius: 10, fontSize: 15, fontWeight: 700, textDecoration: "none",
+            marginBottom: 20, boxShadow: "0 2px 8px rgba(255,146,36,0.3)",
+          }}>
+            📋 複製 Google Sheet 模板
+          </a>
+
+          {/* Steps */}
+          <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+            {steps.map((s, i) => (
+              <div key={i} style={{ background: "#fff", borderRadius: 10, padding: "16px 18px", boxShadow: "0 1px 3px rgba(0,0,0,0.06)" }}>
+                <div style={{ fontSize: 15, fontWeight: 700, marginBottom: 4, color: "#333" }}>
+                  {s.icon} {s.title}
+                </div>
+                <div style={{ fontSize: 13, color: "#666", lineHeight: 1.6 }}>{s.desc}</div>
+              </div>
+            ))}
+          </div>
+
+          <div style={{ marginTop: 16, padding: "12px 16px", background: "#e8f8f5", borderRadius: 8, fontSize: 12, color: "#1a7a5a", lineHeight: 1.7 }}>
+            ✅ 設定完成後，系統會在排程前 <b>3 天</b>、<b>1 天</b>、<b>當天</b> 自動寄 Email 提醒給指定信箱。
+          </div>
+        </div>
+      );
+    }
+
+    // ============ OVERVIEW PAGE ============
+    function OverviewPage({ patients, onSelect, onAdd }) {
+      return (
+        <div style={{ maxWidth: 700, margin: "0 auto", padding: "16px 14px 40px" }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 }}>
+            <h2 style={{ fontSize: 17, fontWeight: 700, color: "#333" }}>📋 患者總覽</h2>
+            <button onClick={onAdd} style={{ padding: "8px 16px", background: "#FF9224", color: "#fff", border: "none", borderRadius: 8, fontSize: 13, fontWeight: 600, cursor: "pointer" }}>+ 新增患者</button>
+          </div>
+          {patients.filter(p => p.firstDate).length === 0 ? (
+            <div style={{ textAlign: "center", padding: "50px 20px", color: "#bbb" }}>
+              <div style={{ fontSize: 36, marginBottom: 10 }}>👤</div>
+              <div style={{ fontSize: 14 }}>尚無患者資料，請新增患者並填入治療日期</div>
+            </div>
+          ) : (
+            <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+              {patients.map((p, idx) => {
+                if (!p.firstDate) return null;
+                const next = getNextEvent(p.events);
+                const infDone = p.events.filter(e => e.type === "infusion" && e.date < new Date()).length;
+                const infTotal = p.events.filter(e => e.type === "infusion").length;
+                const edited = p.events.filter(e => e.edited).length;
+                return (
+                  <div key={p.id} onClick={() => onSelect(p.id)} style={{ background: "#fff", borderRadius: 10, padding: "16px 18px", boxShadow: "0 1px 3px rgba(0,0,0,0.06)", cursor: "pointer", borderLeft: "4px solid #FF9224" }}>
+                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
+                      <div style={{ fontSize: 16, fontWeight: 700, color: "#333" }}>{p.name || `患者 ${idx + 1}`}</div>
+                      <div style={{ fontSize: 11, color: "#999" }}>首次治療 {p.firstDate}</div>
+                    </div>
+                    <div style={{ display: "flex", gap: 16, fontSize: 12, color: "#666", flexWrap: "wrap" }}>
+                      <div><span style={{ color: "#999" }}>進度</span> <span style={{ fontWeight: 600, color: "#e07800" }}>{infDone}/{infTotal}</span> 次輸注</div>
+                      {next && <div><span style={{ color: "#999" }}>下次</span> <span style={{ fontWeight: 600 }}>{formatDateTW(next.date)}</span> <Badge type={next.type} /></div>}
+                      {edited > 0 && <div style={{ color: "#e07800" }}>✎ {edited} 筆已調整</div>}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    // ============ SCHEDULE PAGE ============
+    function SchedulePage({ patient, updatePatient, updateEventDate, onBack, scriptUrl, email, setScriptUrl, setEmail, showToast }) {
+      const events = patient.events;
+      const filtered = patient.filter === "all" ? events : events.filter(e => e.type === patient.filter);
+      const infCount = events.filter(e => e.type === "infusion").length;
+      const mriCount = events.filter(e => e.type === "mri").length;
+      const lastEv = events.length ? events[events.length - 1] : null;
+      const [showSettings, setShowSettings] = useState(false);
+
+      const handleICS = async () => {
+        if (!events.length) return;
+        dlFile(generateICS(events, patient.name), `Kisunla_${patient.name || "patient"}.ics`, "text/calendar;charset=utf-8");
+        if (email && scriptUrl) {
+          await postToSheet(scriptUrl, patient.name, email, patient.firstDate, patient.mriDays, events);
+          showToast(`✅ 排程已送出，提醒信將寄至 ${email}`, "ok");
+        }
+      };
+      const handleXLSX = async () => {
+        if (!events.length) return;
+        XLSX.writeFile(generateExcel(events, patient.name, patient.firstDate, patient.mriDays), `Kisunla_${patient.name || "patient"}.xlsx`);
+        if (email && scriptUrl) {
+          await postToSheet(scriptUrl, patient.name, email, patient.firstDate, patient.mriDays, events);
+          showToast(`✅ 排程已送出，提醒信將寄至 ${email}`, "ok");
+        }
+      };
+
+      const inputStyle = { width: "100%", padding: "9px 11px", border: "1.5px solid #d5d8dc", borderRadius: 6, fontSize: 15, boxSizing: "border-box", outline: "none" };
+
+      return (
+        <div style={{ maxWidth: 700, margin: "0 auto", padding: "16px 14px 40px" }}>
+          <button onClick={onBack} style={{ padding: "6px 14px", background: "none", border: "1.5px solid #ddd", borderRadius: 8, fontSize: 13, color: "#888", cursor: "pointer", marginBottom: 12 }}>← 返回總覽</button>
+
+          {/* Input */}
+          <div style={{ background: "#fff", borderRadius: 10, padding: "18px", marginBottom: 14, boxShadow: "0 1px 3px rgba(0,0,0,0.06)" }}>
+            <div style={{ display: "flex", gap: 12, flexWrap: "wrap", marginBottom: 12 }}>
+              <div style={{ flex: "1 1 140px" }}>
+                <label style={{ display: "block", fontSize: 12, fontWeight: 600, color: "#666", marginBottom: 5 }}>患者姓名</label>
+                <input type="text" placeholder="選填" value={patient.name} onChange={(e) => updatePatient(patient.id, { name: e.target.value })} style={inputStyle} />
+              </div>
+              <div style={{ flex: "1 1 140px" }}>
+                <label style={{ display: "block", fontSize: 12, fontWeight: 600, color: "#666", marginBottom: 5 }}>首次治療日 *</label>
+                <input type="date" value={patient.firstDate} onChange={(e) => updatePatient(patient.id, { firstDate: e.target.value })} style={inputStyle} />
+              </div>
+            </div>
+            <div style={{ display: "flex", gap: 12, flexWrap: "wrap" }}>
+              <div style={{ flex: "0 0 110px" }}>
+                <label style={{ display: "block", fontSize: 12, fontWeight: 600, color: "#666", marginBottom: 5 }}>MRI 提前天數</label>
+                <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                  <input type="number" min="1" max="28" value={patient.mriDays} onChange={(e) => updatePatient(patient.id, { mriDays: e.target.value })}
+                    style={{ width: 60, padding: "9px 8px", border: "1.5px solid #d5d8dc", borderRadius: 6, fontSize: 15, textAlign: "center", outline: "none", height: 44, WebkitAppearance: "none", appearance: "none" }} />
+                  <span style={{ fontSize: 13, color: "#888" }}>天</span>
+                </div>
+              </div>
+            </div>
+
+            {/* Advanced settings toggle */}
+            <div style={{ marginTop: 14, borderTop: "1px solid #f0f0f0", paddingTop: 12 }}>
+              <button onClick={() => setShowSettings(!showSettings)} style={{
+                background: "none", border: "none", fontSize: 12, color: "#999", cursor: "pointer", fontWeight: 500,
+              }}>
+                {showSettings ? "▼" : "▶"} ⚙️ 進階設定（Email 提醒）
+              </button>
+              {showSettings && (
+                <div style={{ marginTop: 10, display: "flex", gap: 12, flexWrap: "wrap" }}>
+                  <div style={{ flex: "1 1 200px" }}>
+                    <label style={{ display: "block", fontSize: 12, fontWeight: 600, color: "#666", marginBottom: 5 }}>Apps Script URL</label>
+                    <input type="url" placeholder="https://script.google.com/..." value={scriptUrl} onChange={(e) => setScriptUrl(e.target.value)} style={{ ...inputStyle, fontSize: 13 }} />
+                  </div>
+                  <div style={{ flex: "1 1 160px" }}>
+                    <label style={{ display: "block", fontSize: 12, fontWeight: 600, color: "#666", marginBottom: 5 }}>通知 Email</label>
+                    <input type="email" placeholder="doctor@hospital.com" value={email} onChange={(e) => setEmail(e.target.value)} style={inputStyle} />
+                  </div>
+                  {scriptUrl && email && (
+                    <div style={{ width: "100%", fontSize: 11, color: "#27ae60", fontWeight: 500 }}>
+                      ✅ 已設定：下載時將自動把排程送入 Google Sheet，系統會於 3天前 / 1天前 / 當天 寄信至 {email}
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+          </div>
+
+          {events.length > 0 ? (
+            <>
+              <div style={{ display: "flex", gap: 8, marginBottom: 14, flexWrap: "wrap" }}>
+                {[
+                  { val: infCount, unit: "次輸注", color: "#e07800" },
+                  { val: mriCount, unit: "次 MRI", color: "#6c3483" },
+                  { val: lastEv ? formatDateTW(lastEv.date) : "—", unit: "最後排程", color: "#1e8449", small: true },
+                ].map((c, i) => (
+                  <div key={i} style={{ flex: "1 1 90px", background: "#fff", borderRadius: 8, padding: "12px 14px", boxShadow: "0 1px 3px rgba(0,0,0,0.05)", borderLeft: `3px solid ${c.color}` }}>
+                    <div style={{ fontSize: c.small ? 13 : 22, fontWeight: 700, color: c.color }}>{c.val}</div>
+                    <div style={{ fontSize: 11, color: "#999" }}>{c.unit}</div>
+                  </div>
+                ))}
+              </div>
+
+              <div style={{ display: "flex", gap: 10, marginBottom: 16, flexWrap: "wrap" }}>
+                <button onClick={handleICS} style={{ flex: 1, padding: "11px 14px", background: "#FF9224", color: "#fff", border: "none", borderRadius: 8, fontSize: 13, fontWeight: 600, cursor: "pointer", minWidth: 140 }}>📅 下載日曆檔 (.ics)</button>
+                <button onClick={handleXLSX} style={{ flex: 1, padding: "11px 14px", background: "#1e8449", color: "#fff", border: "none", borderRadius: 8, fontSize: 13, fontWeight: 600, cursor: "pointer", minWidth: 140 }}>📊 下載 Excel 表格</button>
+              </div>
+
+              <div style={{ display: "flex", marginBottom: 10, background: "#e5e8eb", borderRadius: 8, padding: 3 }}>
+                {[
+                  { key: "all", label: `全部 (${events.length})` },
+                  { key: "infusion", label: `輸注 (${infCount})` },
+                  { key: "mri", label: `MRI (${mriCount})` },
+                ].map((t) => (
+                  <button key={t.key} onClick={() => updatePatient(patient.id, { filter: t.key })} style={{
+                    flex: 1, padding: "7px 10px", border: "none", borderRadius: 6,
+                    fontSize: 12, fontWeight: patient.filter === t.key ? 700 : 400,
+                    background: patient.filter === t.key ? "#fff" : "transparent",
+                    color: patient.filter === t.key ? "#e07800" : "#777", cursor: "pointer",
+                    boxShadow: patient.filter === t.key ? "0 1px 3px rgba(0,0,0,0.08)" : "none",
+                  }}>{t.label}</button>
+                ))}
+              </div>
+
+              <div style={{ background: "#fff", borderRadius: 10, overflow: "hidden", boxShadow: "0 1px 3px rgba(0,0,0,0.06)" }}>
+                <div style={{ display: "flex", padding: "9px 14px", background: "#f0f2f5", fontSize: 11, fontWeight: 600, color: "#888", borderBottom: "1px solid #e8eaed" }}>
+                  <div style={{ flex: 1 }}>週次</div>
+                  <div style={{ flex: 2 }}>日期</div>
+                  <div style={{ flex: 1, textAlign: "center" }}>類型</div>
+                  <div style={{ flex: 2 }}>項目</div>
+                </div>
+                {filtered.map((ev, i) => {
+                  const isPast = ev.date < new Date();
+                  const isToday = formatDate(ev.date) === formatDate(new Date());
+                  return (
+                    <div key={ev.id} style={{
+                      display: "flex", alignItems: "center", padding: "8px 14px",
+                      borderBottom: i < filtered.length - 1 ? "1px solid #f2f3f5" : "none",
+                      opacity: isPast && !isToday ? 0.45 : 1,
+                      background: isToday ? "#fffde7" : ev.edited ? "#fff8f0" : "transparent", fontSize: 13,
+                    }}>
+                      <div style={{ flex: 1, fontWeight: 600, color: "#aaa", fontSize: 11 }}>{ev.week}</div>
+                      <div style={{ flex: 2 }}>
+                        <div className="date-cell">
+                          <span style={{ fontWeight: 500, color: ev.edited ? "#e07800" : "#333", fontSize: 13 }}>{formatDateTW(ev.date)}</span>
+                          <input type="date" value={formatDate(ev.date)} onChange={(e) => e.target.value && updateEventDate(patient.id, ev.id, e.target.value)} />
+                        </div>
+                      </div>
+                      <div style={{ flex: 1, textAlign: "center" }}><Badge type={ev.type} /></div>
+                      <div style={{ flex: 2, paddingLeft: 6 }}>
+                        <div style={{ fontWeight: 500, fontSize: 12 }}>
+                          {ev.label}
+                          {ev.edited && <span style={{ marginLeft: 4, fontSize: 10, color: "#e07800" }}>✎</span>}
+                        </div>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+
+              <div style={{ marginTop: 14, padding: "11px 14px", background: "#fef9e7", borderRadius: 8, fontSize: 11, color: "#7d6608", lineHeight: 1.7 }}>
+                ⚠️ 此排程為標準建議時程，實際日期需依醫師評估調整。MRI 若遇週六日將自動提前至週五。
+                <br />✎ 點擊日期可手動調整，調整後會以橘色標示，下載的檔案會同步更新。
+              </div>
+            </>
+          ) : (
+            <div style={{ textAlign: "center", padding: "50px 20px", color: "#bbb" }}>
+              <div style={{ fontSize: 36, marginBottom: 10 }}>📅</div>
+              <div style={{ fontSize: 14 }}>請輸入首次治療日以產生排程</div>
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    // ============ MAIN APP ============
+    function App() {
+      const [patients, setPatients] = useState([createPatient(1)]);
+      const [nextId, setNextId] = useState(2);
+      const [page, setPage] = useState("schedule");
+      const [activeId, setActiveId] = useState(1);
+      const [scriptUrl, setScriptUrl] = useState("");
+      const [email, setEmail] = useState("");
+      const [toast, setToast] = useState({ show: false, msg: "", type: "ok" });
+
+      const showToast = useCallback((msg, type = "ok") => {
+        setToast({ show: true, msg, type });
+        setTimeout(() => setToast(t => ({ ...t, show: false })), 3000);
+      }, []);
+
+      const updatePatient = useCallback((id, updates) => {
+        setPatients(prev => prev.map(p => {
+          if (p.id !== id) return p;
+          const u = { ...p, ...updates };
+          if (('firstDate' in updates || 'mriDays' in updates) && u.firstDate) u.events = generateSchedule(u.firstDate, u.mriDays);
+          return u;
+        }));
+      }, []);
+
+      const updateEventDate = useCallback((pid, eid, ds) => {
+        setPatients(prev => prev.map(p => {
+          if (p.id !== pid) return p;
+          return { ...p, events: p.events.map(ev => ev.id !== eid ? ev : { ...ev, date: new Date(ds + "T00:00:00"), edited: true }).sort((a, b) => a.date - b.date) };
+        }));
+      }, []);
+
+      const addPatient = () => { setPatients(prev => [...prev, createPatient(nextId)]); setActiveId(nextId); setNextId(n => n + 1); setPage("schedule"); };
+      const selectPatient = (id) => { setActiveId(id); setPage("schedule"); };
+      const active = patients.find(p => p.id === activeId) || patients[0];
+
+      return (
+        <div style={{ minHeight: "100vh", background: "#f5f6f8" }}>
+          <div style={{ background: "linear-gradient(135deg, #e07800 0%, #FF9224 100%)", color: "#fff", padding: "24px 20px 16px" }}>
+            <div style={{ maxWidth: 700, margin: "0 auto" }}>
+              <div style={{ fontSize: 11, letterSpacing: 2, opacity: 0.6, marginBottom: 2 }}>KISUNLA™ (DONANEMAB-AZBT)</div>
+              <h1 style={{ margin: 0, fontSize: 20, fontWeight: 700 }}>欣智樂 治療排程產生器</h1>
+              <p style={{ margin: "4px 0 0", fontSize: 12, opacity: 0.85 }}>Q4W 輸注 × 19 次 ｜ MRI 於第 2、3、4、7 次輸注前（自訂天數，避開週末）</p>
+              <div style={{ display: "flex", gap: 4, marginTop: 14 }}>
+                {[
+                  { key: "overview", label: "📋 患者總覽" },
+                  { key: "schedule", label: "📅 排程編輯" },
+                  { key: "setup", label: "⚙️ 設定指南" },
+                ].map(t => (
+                  <button key={t.key} onClick={() => setPage(t.key)} style={{
+                    padding: "6px 16px", border: "none", borderRadius: "6px 6px 0 0",
+                    fontSize: 13, fontWeight: page === t.key ? 700 : 400, cursor: "pointer",
+                    background: page === t.key ? "#f5f6f8" : "rgba(255,255,255,0.15)",
+                    color: page === t.key ? "#e07800" : "rgba(255,255,255,0.8)",
+                  }}>{t.label}</button>
+                ))}
+              </div>
+            </div>
+          </div>
+
+          {page === "setup" && <SetupPage />}
+          {page === "overview" && <OverviewPage patients={patients} onSelect={selectPatient} onAdd={addPatient} />}
+          {page === "schedule" && (
+            <>
+              <div style={{ background: "#fff", borderBottom: "1px solid #eee", padding: "10px 14px", overflowX: "auto" }}>
+                <div style={{ maxWidth: 700, margin: "0 auto", display: "flex", alignItems: "center", gap: 6 }}>
+                  {patients.map((p, idx) => (
+                    <button key={p.id} onClick={() => setActiveId(p.id)} style={{
+                      padding: "5px 12px", border: activeId === p.id ? "2px solid #FF9224" : "1.5px solid #ddd",
+                      borderRadius: 20, fontSize: 12, fontWeight: activeId === p.id ? 700 : 400,
+                      background: activeId === p.id ? "#fff8f0" : "#fff",
+                      color: activeId === p.id ? "#e07800" : "#888", cursor: "pointer", whiteSpace: "nowrap",
+                    }}>{p.name || `患者 ${idx + 1}`}</button>
+                  ))}
+                  <button onClick={addPatient} style={{ padding: "5px 12px", border: "1.5px dashed #ccc", borderRadius: 20, fontSize: 12, background: "transparent", color: "#bbb", cursor: "pointer", whiteSpace: "nowrap" }}>+ 新增</button>
+                </div>
+              </div>
+              <SchedulePage patient={active} updatePatient={updatePatient} updateEventDate={updateEventDate}
+                onBack={() => setPage("overview")} scriptUrl={scriptUrl} email={email} setScriptUrl={setScriptUrl} setEmail={setEmail} showToast={showToast} />
+            </>
+          )}
+          <Toast msg={toast.msg} type={toast.type} show={toast.show} />
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+  </script>
+</body>
+</html>
